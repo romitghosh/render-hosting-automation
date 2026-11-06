@@ -17,25 +17,42 @@ jobs:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          RESPONSE=$(curl --silent --show-error --fail-with-body \
+          if [ -z "$NOTION_API_KEY" ] || [ -z "$DATA_SOURCE_ID" ]; then
+            echo "Missing required GitHub secret or variable."
+            exit 1
+          fi
+
+          HTTP_STATUS=$(curl --silent --show-error \
+            -o response.json \
+            -w "%{http_code}" \
             "https://api.notion.com/v1/data_sources/${DATA_SOURCE_ID}" \
             -H "Authorization: Bearer ${NOTION_API_KEY}" \
             -H "Notion-Version: 2025-09-03")
 
+          echo "HTTP Status: ${HTTP_STATUS}"
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Notion API error:"
+            jq '{code, message}' response.json
+            exit 1
+          fi
+
           echo "Notion connection successful."
           echo "Projects database properties:"
-          echo "$RESPONSE" | jq -r '.properties | keys[]'
+          jq -r '.properties | keys[]' response.json
 
       - name: Test Projects data source query
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
 
-          RESPONSE=$(curl --silent --show-error --fail-with-body \
+          HTTP_STATUS=$(curl --silent --show-error \
+            -o query-response.json \
+            -w "%{http_code}" \
             -X POST \
             "https://api.notion.com/v1/data_sources/${DATA_SOURCE_ID}/query" \
             -H "Authorization: Bearer ${NOTION_API_KEY}" \
@@ -43,7 +60,15 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{"page_size": 1}')
 
-          COUNT=$(echo "$RESPONSE" | jq '.results | length')
+          echo "Query HTTP Status: ${HTTP_STATUS}"
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Notion query error:"
+            jq '{code, message}' query-response.json
+            exit 1
+          fi
+
+          COUNT=$(jq '.results | length' query-response.json)
 
           echo "Projects query successful."
           echo "Records returned: ${COUNT}"
