@@ -234,8 +234,13 @@ jobs:
               print(f"STATUS: {project['status'] or 'Not set'}")
 
               if project["status"] == "Not Applicable":
-                  print("DECISION: IGNORE")
-                  continue
+                print("DECISION: IGNORE - NOT APPLICABLE")
+                continue
+
+              if project["extension"] == "Lifetime":
+                print("DECISION: KEEP RUNNING - LIFETIME")
+                print("No Render API lookup required.")
+                continue
 
               service_id = project["service_id"]
 
