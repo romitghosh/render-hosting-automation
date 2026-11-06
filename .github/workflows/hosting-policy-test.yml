@@ -1,0 +1,155 @@
+
+name: Hosting Policy Simulation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  simulate-hosting:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test hosting lifecycle rules
+        run: |
+          python3 <<'PY'
+          from datetime import date, timedelta
+
+          today = date.today()
+
+          scenarios = [
+              {
+                  "name": "Active with future expiry",
+                  "status": "Active",
+                  "extension": "No Extension",
+                  "expiry": today + timedelta(days=5),
+                  "service_id": "service-001",
+                  "suspended": False,
+                  "expected": "KEEP RUNNING",
+              },
+              {
+                  "name": "Active with past expiry",
+                  "status": "Active",
+                  "extension": "No Extension",
+                  "expiry": today - timedelta(days=1),
+                  "service_id": "service-002",
+                  "suspended": False,
+                  "expected": "SUSPEND AND MARK EXPIRED",
+              },
+              {
+                  "name": "Expired with future extension",
+                  "status": "Expired",
+                  "extension": "7 Days",
+                  "expiry": today + timedelta(days=7),
+                  "service_id": "service-003",
+                  "suspended": True,
+                  "expected": "RESUME AND MARK ACTIVE",
+              },
+              {
+                  "name": "Expired with past expiry",
+                  "status": "Expired",
+                  "extension": "No Extension",
+                  "expiry": today - timedelta(days=2),
+                  "service_id": "service-004",
+                  "suspended": True,
+                  "expected": "KEEP SUSPENDED",
+              },
+              {
+                  "name": "Lifetime hosting",
+                  "status": "Active",
+                  "extension": "Lifetime",
+                  "expiry": None,
+                  "service_id": "service-005",
+                  "suspended": False,
+                  "expected": "KEEP RUNNING",
+              },
+              {
+                  "name": "Not applicable",
+                  "status": "Not Applicable",
+                  "extension": "No Extension",
+                  "expiry": today - timedelta(days=5),
+                  "service_id": "service-006",
+                  "suspended": False,
+                  "expected": "IGNORE",
+              },
+              {
+                  "name": "Missing Render service ID",
+                  "status": "Active",
+                  "extension": "No Extension",
+                  "expiry": today - timedelta(days=1),
+                  "service_id": "",
+                  "suspended": False,
+                  "expected": "SKIP AND REPORT",
+              },
+          ]
+
+          def evaluate(project):
+              status = project["status"]
+              extension = project["extension"]
+              expiry = project["expiry"]
+              service_id = project["service_id"]
+              suspended = project["suspended"]
+
+              if status == "Not Applicable":
+                  return "IGNORE"
+
+              if not service_id:
+                  return "SKIP AND REPORT"
+
+              if extension == "Lifetime":
+                  return "KEEP RUNNING" if not suspended else "REVIEW LIFETIME SERVICE"
+
+              if not expiry:
+                  return "SKIP AND REPORT"
+
+              if status not in ("Active", "Expired"):
+                  return "SKIP AND REPORT"
+
+              if expiry > today:
+                  if suspended:
+                      return "RESUME AND MARK ACTIVE"
+                  return "KEEP RUNNING"
+
+              if expiry < today:
+                  if status == "Active":
+                      if suspended:
+                          return "MARK EXPIRED"
+                      return "SUSPEND AND MARK EXPIRED"
+
+                  return "KEEP SUSPENDED"
+
+              # Expiry date is today: remain active throughout today.
+              if suspended:
+                  return "REVIEW — SUSPENDED BEFORE EXPIRY"
+
+              return "KEEP RUNNING"
+
+          passed = 0
+
+          print(f"Simulation date: {today}")
+          print("SIMULATION ONLY — NO LIVE ACTIONS")
+          print("=" * 65)
+
+          for project in scenarios:
+              actual = evaluate(project)
+              expected = project["expected"]
+              success = actual == expected
+
+              if success:
+                  passed += 1
+
+              print(f"Scenario: {project['name']}")
+              print(f"Expected: {expected}")
+              print(f"Actual:   {actual}")
+              print(f"Result:   {'PASS' if success else 'FAIL'}")
+              print("-" * 65)
+
+          print(f"SUMMARY: {passed}/{len(scenarios)} scenarios passed.")
+
+          if passed != len(scenarios):
+              raise SystemExit("Hosting policy simulation failed.")
+
+          print("All hosting policy tests passed.")
+          PY
