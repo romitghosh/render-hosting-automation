@@ -1,0 +1,78 @@
+
+name: Project Hosting Data Inspection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-projects:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Retrieve and inspect project hosting data
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$NOTION_API_KEY" ] || [ -z "$DATA_SOURCE_ID" ]; then
+            echo "Missing Notion credentials or data source ID."
+            exit 1
+          fi
+
+          echo "Retrieving Projects records..."
+
+          curl --silent --show-error --fail-with-body \
+            -X POST \
+            "https://api.notion.com/v1/data_sources/${DATA_SOURCE_ID}/query" \
+            -H "Authorization: Bearer ${NOTION_API_KEY}" \
+            -H "Notion-Version: 2025-09-03" \
+            -H "Content-Type: application/json" \
+            -d '{"page_size": 100}' \
+            -o projects.json
+
+          echo "Projects retrieved successfully."
+
+          jq -r '
+            def prop($name): .properties[$name];
+
+            def title_value:
+              map(.plain_text) | join("");
+
+            def select_value:
+              if . == null then "Not set"
+              else .name // "Not set"
+              end;
+
+            def date_value:
+              if . == null then "Not set"
+              else .start // "Not set"
+              end;
+
+            def text_value:
+              if . == null then "Not set"
+              else .rich_text | title_value
+              end;
+
+            (
+              ["PROJECT", "EXPIRY DATE", "EXTENSION", "STATUS", "RENDER SERVICE ID"],
+              (
+                .results[] |
+                [
+                  (prop("Project Name").title | title_value),
+                  (prop("Hosting Expiry Date").date | date_value),
+                  (prop("Hosting Extension").select | select_value),
+                  (prop("Hosting Status").select | select_value),
+                  (prop("Render Service ID").rich_text | text_value)
+                ]
+              )
+            ) | @tsv
+          ' projects.json
+
+          echo ""
+          echo "Has more pages: $(jq -r '.has_more' projects.json)"
+          echo "Records retrieved: $(jq '.results | length' projects.json)"
