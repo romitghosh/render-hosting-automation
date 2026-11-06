@@ -1,0 +1,49 @@
+
+name: Notion Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-notion:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Retrieve Projects data source
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE=$(curl --silent --show-error --fail-with-body \
+            "https://api.notion.com/v1/data_sources/${DATA_SOURCE_ID}" \
+            -H "Authorization: Bearer ${NOTION_API_KEY}" \
+            -H "Notion-Version: 2025-09-03")
+
+          echo "Notion connection successful."
+          echo "Projects database properties:"
+          echo "$RESPONSE" | jq -r '.properties | keys[]'
+
+      - name: Test Projects data source query
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
+        run: |
+          set -euo pipefail
+
+          RESPONSE=$(curl --silent --show-error --fail-with-body \
+            -X POST \
+            "https://api.notion.com/v1/data_sources/${DATA_SOURCE_ID}/query" \
+            -H "Authorization: Bearer ${NOTION_API_KEY}" \
+            -H "Notion-Version: 2025-09-03" \
+            -H "Content-Type: application/json" \
+            -d '{"page_size": 1}')
+
+          COUNT=$(echo "$RESPONSE" | jq '.results | length')
+
+          echo "Projects query successful."
+          echo "Records returned: ${COUNT}"
