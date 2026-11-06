@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Retrieve and diagnose project properties
+      - name: Retrieve and inspect project hosting data
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
@@ -25,40 +25,27 @@ jobs:
             -H "Authorization: Bearer ${NOTION_API_KEY}" \
             -H "Notion-Version: 2025-09-03" \
             -H "Content-Type: application/json" \
-            -d '{"page_size": 5}' \
+            -d '{"page_size": 100}' \
             -o projects.json
 
           echo "Projects retrieved successfully."
 
-          echo "Response structure:"
-          jq '{
-            results_type: (.results | type),
-            record_count: (.results | length),
-            properties_type: (.results[0].properties | type),
-            property_names: (
-              if (.results[0].properties | type) == "object"
-              then (.results[0].properties | keys)
-              else []
-              end
-            )
-          }' projects.json
+          echo "PROJECT | EXPIRY DATE | EXTENSION | STATUS | RENDER SERVICE ID"
 
-          echo ""
-          echo "Hosting property structures:"
+          jq -r '
+            def plain_text:
+              map(.plain_text // "") | join("");
 
-          jq '
             .results[] |
-            {
-              hosting_expiry_type:
-                (.properties["Hosting Expiry Date"] | type),
-              hosting_extension_type:
-                (.properties["Hosting Extension"] | type),
-              hosting_status_type:
-                (.properties["Hosting Status"] | type),
-              render_service_id_type:
-                (.properties["Render Service ID"] | type)
-            }
+            [
+              ((.properties["Project Name"].title // []) | plain_text),
+              (.properties["Hosting Expiry Date"].date.start // "Not set"),
+              (.properties["Hosting Extension"].select.name // "Not set"),
+              (.properties["Hosting Status"].select.name // "Not set"),
+              ((.properties["Render Service ID"].rich_text // []) | plain_text)
+            ] | @tsv
           ' projects.json
 
           echo ""
-          echo "Diagnostic completed."
+          echo "Records retrieved: $(jq '.results | length' projects.json)"
+          echo "Has more pages: $(jq '.has_more' projects.json)"
