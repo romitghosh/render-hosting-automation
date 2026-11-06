@@ -45,6 +45,7 @@ jobs:
           ).lower() == "true"
 
           NOTION_VERSION = "2025-09-03"
+
           TODAY = datetime.now(
               ZoneInfo("Asia/Kolkata")
           ).date()
@@ -54,9 +55,40 @@ jobs:
               "60 Days", "90 Days"
           }
 
-          def api_request(url, token, version=None,
-                          method="GET", body=None):
+          ACTIONS = {
+              "awaiting": "Awaiting First Hosting Action",
+              "suspended": (
+                  "Automatically Suspended – Hosting Period Expired"
+              ),
+              "resumed": (
+                  "Automatically Resumed – Hosting Extension Activated"
+              ),
+              "manual_suspended": (
+                  "Manually Suspended – Admin Action"
+              ),
+              "manual_resumed": (
+                  "Manually Resumed – Admin Action"
+              ),
+              "suspend_failed": (
+                  "Suspension Failed – Render API Error"
+              ),
+              "resume_failed": (
+                  "Resumption Failed – Render API Error"
+              ),
+              "verification_failed": (
+                  "Hosting Action Failed – Status Verification"
+              ),
+              "lifetime": (
+                  "Hosting Action Skipped – Lifetime Hosting"
+              ),
+              "not_applicable": (
+                  "Hosting Action Skipped – Not Applicable"
+              )
+          }
 
+          def api_request(
+              url, token, version=None, method="GET", body=None
+          ):
               headers = {
                   "Authorization": f"Bearer {token}",
                   "Accept": "application/json"
@@ -74,24 +106,39 @@ jobs:
               )
 
               req = urllib.request.Request(
-                  url, data=data, headers=headers, method=method
+                  url,
+                  data=data,
+                  headers=headers,
+                  method=method
               )
 
               try:
-                  with urllib.request.urlopen(req, timeout=30) as response:
+                  with urllib.request.urlopen(
+                      req, timeout=30
+                  ) as response:
                       content = response.read()
                       return response.status, (
                           json.loads(content) if content else {}
                       )
+
               except urllib.error.HTTPError as error:
-                  detail = error.read().decode(errors="replace")
+                  detail = error.read().decode(
+                      errors="replace"
+                  )
+
                   raise RuntimeError(
-                      f"API request failed: HTTP {error.code}: {detail[:500]}"
+                      f"HTTP {error.code}: {detail[:500]}"
+                  )
+
+              except urllib.error.URLError as error:
+                  raise RuntimeError(
+                      f"Network error: {error}"
                   )
 
           def notion_request(url, method="GET", body=None):
               return api_request(
-                  url, NOTION_KEY,
+                  url,
+                  NOTION_KEY,
                   version=NOTION_VERSION,
                   method=method,
                   body=body
@@ -99,7 +146,9 @@ jobs:
 
           def render_request(url, method="GET"):
               return api_request(
-                  url, RENDER_KEY, method=method
+                  url,
+                  RENDER_KEY,
+                  method=method
               )
 
           def get_projects():
@@ -119,7 +168,9 @@ jobs:
                       body=body
                   )
 
-                  projects.extend(response.get("results", []))
+                  projects.extend(
+                      response.get("results", [])
+                  )
 
                   if not response.get("has_more"):
                       break
@@ -127,7 +178,9 @@ jobs:
                   cursor = response.get("next_cursor")
 
                   if not cursor:
-                      raise RuntimeError("Missing pagination cursor.")
+                      raise RuntimeError(
+                          "Missing Notion pagination cursor."
+                      )
 
               return projects
 
@@ -152,6 +205,10 @@ jobs:
                   p.get("Hosting Status", {}).get("select") or {}
               ).get("name")
 
+              last_action = (
+                  p.get("Last Hosting Action", {}).get("select") or {}
+              ).get("name")
+
               return {
                   "page_id": record["id"],
                   "name": get_text(
@@ -160,52 +217,81 @@ jobs:
                   "expiry": expiry,
                   "extension": extension,
                   "status": status,
+                  "last_action": last_action,
                   "service_id": get_text(
                       p.get("Render Service ID", {}).get("rich_text", [])
                   )
               }
 
-          def update_notion_status(page_id, status):
+          def update_notion(page_id, status=None, action=None):
+              properties = {}
+
+              if status is not None:
+                  properties["Hosting Status"] = {
+                      "select": {"name": status}
+                  }
+
+              if action is not None:
+                  properties["Last Hosting Action"] = {
+                      "select": {"name": action}
+                  }
+
+              if not properties:
+                  return
+
               code, _ = notion_request(
                   f"https://api.notion.com/v1/pages/{page_id}",
                   method="PATCH",
-                  body={
-                      "properties": {
-                          "Hosting Status": {
-                              "select": {"name": status}
-                          }
-                      }
-                  }
+                  body={"properties": properties}
               )
 
               if code != 200:
                   raise RuntimeError(
-                      f"Notion status update returned HTTP {code}"
+                      f"Notion update returned HTTP {code}"
                   )
+
+          def record_action(page_id, action):
+              if not LIVE:
+                  print(f"DRY RUN: Last Hosting Action -> {action}")
+                  return
+
+              update_notion(
+                  page_id,
+                  action=action
+              )
+
+              print(f"NOTION: Last Hosting Action -> {action}")
 
           def get_service(service_id):
               _, service = render_request(
                   f"https://api.render.com/v1/services/{service_id}"
               )
+
               return service
 
-          def change_render_state(service_id, action, expected_state):
+          def change_render_state(
+              service_id, action, expected_state
+          ):
               endpoint = (
                   f"https://api.render.com/v1/services/"
                   f"{service_id}/{action}"
               )
 
-              code, _ = render_request(endpoint, method="POST")
+              code, _ = render_request(
+                  endpoint,
+                  method="POST"
+              )
 
               if code != 202:
                   raise RuntimeError(
                       f"Render {action} returned HTTP {code}"
                   )
 
-              # Render accepts the operation asynchronously.
-              # Verify the resulting state before changing Notion.
+              # Render processes this operation asynchronously.
+              # Verify the final state before updating Notion.
               for attempt in range(12):
                   time.sleep(5)
+
                   service = get_service(service_id)
 
                   if service.get("suspended") == expected_state:
@@ -227,6 +313,7 @@ jobs:
               project = read_project(record)
 
               name = project["name"]
+              page_id = project["page_id"]
               status = project["status"]
               extension = project["extension"]
               expiry = project["expiry"]
@@ -235,12 +322,30 @@ jobs:
               print("-" * 65)
               print(f"PROJECT: {name}")
 
+              # Ignore projects where hosting is not applicable.
               if status == "Not Applicable":
                   print("ACTION: IGNORE - NOT APPLICABLE")
+
+                  try:
+                      record_action(
+                          page_id, ACTIONS["not_applicable"]
+                      )
+                  except RuntimeError as error:
+                      print(f"ERROR RECORDING ACTION: {error}")
+
                   continue
 
+              # Lifetime projects must never be suspended.
               if extension == "Lifetime":
                   print("ACTION: KEEP RUNNING - LIFETIME")
+
+                  try:
+                      record_action(
+                          page_id, ACTIONS["lifetime"]
+                      )
+                  except RuntimeError as error:
+                      print(f"ERROR RECORDING ACTION: {error}")
+
                   continue
 
               if not service_id:
@@ -257,9 +362,24 @@ jobs:
 
               try:
                   service = get_service(service_id)
+
               except RuntimeError as error:
-                  print(f"ACTION: SKIP - SERVICE LOOKUP FAILED")
-                  print(str(error))
+                  print("ACTION: SKIP - SERVICE LOOKUP FAILED")
+                  print(f"ERROR: {error}")
+
+                  failure_action = (
+                      ACTIONS["suspend_failed"]
+                      if status == "Active"
+                      else ACTIONS["resume_failed"]
+                  )
+
+                  try:
+                      record_action(page_id, failure_action)
+                  except RuntimeError as notion_error:
+                      print(
+                          f"ERROR RECORDING FAILURE: {notion_error}"
+                      )
+
                   continue
 
               if service.get("type") != "static_site":
@@ -270,9 +390,14 @@ jobs:
                   print("ACTION: SKIP - SERVICE ID MISMATCH")
                   continue
 
-              expiry_date = datetime.fromisoformat(
-                  expiry
-              ).date()
+              try:
+                  expiry_date = datetime.fromisoformat(
+                      expiry
+                  ).date()
+
+              except ValueError:
+                  print("ACTION: SKIP - INVALID EXPIRY DATE")
+                  continue
 
               suspended = service.get("suspended")
 
@@ -284,32 +409,50 @@ jobs:
               action = None
               new_status = None
               expected_state = None
+              success_action = None
+              failure_action = None
 
+              # Expired hosting period: suspend the website.
               if status == "Active" and expiry_date < TODAY:
                   if suspended == "not_suspended":
                       action = "suspend"
                       new_status = "Expired"
                       expected_state = "suspended"
-                  else:
+                      success_action = ACTIONS["suspended"]
+                      failure_action = ACTIONS["suspend_failed"]
+
+                  elif suspended == "suspended":
                       print("ACTION: ALREADY SUSPENDED")
                       new_status = "Expired"
 
+                  else:
+                      print("ACTION: SKIP - UNKNOWN RENDER STATE")
+                      continue
+
+              # Expired project with a paid future extension: resume.
               elif status == "Expired" and expiry_date >= TODAY:
                   if extension not in PAID_EXTENSIONS:
-                      print("ACTION: SKIP - VALID EXTENSION NOT RECORDED")
+                      print(
+                          "ACTION: SKIP - VALID EXTENSION NOT RECORDED"
+                      )
                       continue
 
                   if suspended == "suspended":
                       action = "resume"
                       new_status = "Active"
                       expected_state = "not_suspended"
+                      success_action = ACTIONS["resumed"]
+                      failure_action = ACTIONS["resume_failed"]
+
                   elif suspended == "not_suspended":
                       print("ACTION: ALREADY RUNNING")
                       new_status = "Active"
+
                   else:
                       print("ACTION: SKIP - UNKNOWN RENDER STATE")
                       continue
 
+              # Active projects remain available through expiry day.
               elif status == "Active" and expiry_date >= TODAY:
                   print("ACTION: KEEP RUNNING")
                   continue
@@ -318,47 +461,114 @@ jobs:
                   print("ACTION: KEEP EXPIRED")
                   continue
 
+              # Reconcile Notion status if Render is already
+              # in the correct state. No new Render action occurred.
               if new_status and not action:
-                  if status != new_status and LIVE:
-                      update_notion_status(
-                          project["page_id"], new_status
+                  if status != new_status:
+                      print(
+                          f"DECISION: STATUS SHOULD BE {new_status}"
                       )
-                      print(f"NOTION: STATUS UPDATED TO {new_status}")
-                  else:
-                      print(f"DECISION: STATUS SHOULD BE {new_status}")
+
+                      if LIVE:
+                          try:
+                              update_notion(
+                                  page_id,
+                                  status=new_status
+                              )
+
+                              print(
+                                  f"NOTION: STATUS UPDATED TO {new_status}"
+                              )
+
+                          except RuntimeError as error:
+                              print(
+                                  f"ERROR UPDATING NOTION: {error}"
+                              )
+                      else:
+                          print("DRY RUN: No changes made.")
+
                   continue
 
               if not action:
                   continue
 
-              print(f"PROPOSED RENDER ACTION: {action.upper()}")
+              print(
+                  f"PROPOSED RENDER ACTION: {action.upper()}"
+              )
 
               if not LIVE:
                   print("DRY RUN: No changes made.")
+                  print(
+                      f"DRY RUN: Last Hosting Action -> {success_action}"
+                  )
                   continue
 
+              # Perform and verify the Render operation.
               try:
                   confirmed = change_render_state(
-                      service_id, action, expected_state
+                      service_id,
+                      action,
+                      expected_state
                   )
-
-                  if not confirmed:
-                      print(
-                          "ERROR: Render state not confirmed. "
-                          "Notion status left unchanged."
-                      )
-                      continue
-
-                  update_notion_status(
-                      project["page_id"], new_status
-                  )
-
-                  print(f"SUCCESS: Render {action} confirmed.")
-                  print(f"SUCCESS: Notion status set to {new_status}.")
 
               except RuntimeError as error:
-                  print(f"ERROR: {error}")
-                  print("Notion status was not changed.")
+                  print(f"ERROR: Render {action} failed: {error}")
+
+                  try:
+                      record_action(page_id, failure_action)
+                  except RuntimeError as notion_error:
+                      print(
+                          f"ERROR RECORDING FAILURE: {notion_error}"
+                      )
+
+                  print("Notion Hosting Status left unchanged.")
+                  continue
+
+              if not confirmed:
+                  print(
+                      "ERROR: Render state not confirmed."
+                  )
+
+                  try:
+                      record_action(
+                          page_id,
+                          ACTIONS["verification_failed"]
+                      )
+                  except RuntimeError as notion_error:
+                      print(
+                          f"ERROR RECORDING FAILURE: {notion_error}"
+                      )
+
+                  print("Notion Hosting Status left unchanged.")
+                  continue
+
+              print(
+                  f"SUCCESS: Render {action} confirmed."
+              )
+
+              # Update Hosting Status and Last Hosting Action
+              # together, only after Render confirms its state.
+              try:
+                  update_notion(
+                      page_id,
+                      status=new_status,
+                      action=success_action
+                  )
+
+                  print(
+                      f"SUCCESS: Notion Hosting Status -> {new_status}"
+                  )
+
+                  print(
+                      f"SUCCESS: Last Hosting Action -> {success_action}"
+                  )
+
+              except RuntimeError as error:
+                  print(
+                      "ERROR: Render operation succeeded, "
+                      "but Notion update failed."
+                  )
+                  print(f"DETAIL: {error}")
 
           print("")
           print("=" * 65)
