@@ -4,7 +4,7 @@ name: Hosting Lifecycle Manager
 on:
   workflow_dispatch:
   schedule:
-    # 12:15 AM India Standard Time (18:45 UTC previous day)
+    # 12:15 AM IST every day
     - cron: "45 18 * * *"
 
 permissions:
@@ -15,21 +15,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Evaluate hosting lifecycle
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
           DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
           TZ: Asia/Kolkata
+
         run: |
           set -euo pipefail
 
           python3 <<'PY'
-          import json
           import os
+          import json
           import urllib.request
           import urllib.error
           from datetime import date
@@ -41,9 +39,11 @@ jobs:
 
           NOTION_VERSION = "2025-09-03"
           TODAY = date.today()
+          DRY_RUN = True
+
           IST = ZoneInfo("Asia/Kolkata")
 
-          def request(url, token, version=None, method="GET", body=None):
+          def api_request(url, token, version=None, method="GET", body=None):
               headers = {
                   "Authorization": f"Bearer {token}",
                   "Accept": "application/json"
@@ -55,31 +55,37 @@ jobs:
               if body is not None:
                   headers["Content-Type"] = "application/json"
 
-              data = json.dumps(body).encode() if body is not None else None
-              req = urllib.request.Request(
-                  url, data=data, headers=headers, method=method
+              data = (
+                  json.dumps(body).encode("utf-8")
+                  if body is not None else None
+              )
+
+              request = urllib.request.Request(
+                  url,
+                  data=data,
+                  headers=headers,
+                  method=method
               )
 
               try:
-                  with urllib.request.urlopen(req, timeout=30) as response:
-                      return json.loads(response.read())
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      content = response.read()
+                      return json.loads(content) if content else {}
               except urllib.error.HTTPError as error:
                   print(f"API request failed: HTTP {error.code}")
                   raise
 
-          def plain_text(items):
-              return "".join(item.get("plain_text", "") for item in (items or []))
-
-          def get_projects():
-              results = []
+          def get_notion_projects():
+              projects = []
               cursor = None
 
               while True:
                   body = {"page_size": 100}
+
                   if cursor:
                       body["start_cursor"] = cursor
 
-                  response = request(
+                  response = api_request(
                       f"https://api.notion.com/v1/data_sources/{DATA_SOURCE_ID}/query",
                       NOTION_KEY,
                       version=NOTION_VERSION,
@@ -87,129 +93,181 @@ jobs:
                       body=body
                   )
 
-                  results.extend(response.get("results", []))
+                  projects.extend(response.get("results", []))
 
                   if not response.get("has_more"):
                       break
 
                   cursor = response.get("next_cursor")
+
                   if not cursor:
-                      raise RuntimeError("Notion pagination cursor missing.")
+                      raise RuntimeError("Missing Notion pagination cursor.")
 
-              return results
+              return projects
 
-          def get_render_services():
-              response = request(
-                  "https://api.render.com/v1/services?limit=100",
+          def get_render_service(service_id):
+              return api_request(
+                  f"https://api.render.com/v1/services/{service_id}",
                   RENDER_KEY
               )
 
-              return {
-                  item["service"]["id"]: item["service"]
-                  for item in response
-                  if item.get("service", {}).get("id")
-              }
-
-          projects = get_projects()
-          services = get_render_services()
-
-          print(f"Today's date (IST): {TODAY}")
-          print(f"Projects retrieved: {len(projects)}")
-          print(f"Render services retrieved: {len(services)}")
-          print("")
-          print("DRY-RUN MODE: No services or Notion records will be modified.")
-          print("")
-
-          for project in projects:
-              props = project.get("properties", {})
-
-              name = plain_text(
-                  props.get("Project Name", {}).get("title", [])
-              ) or "Unnamed project"
-
-              expiry = (
-                  props.get("Hosting Expiry Date", {})
-                  .get("date", {}) or {}
-              ).get("start")
-
-              extension = (
-                  props.get("Hosting Extension", {})
-                  .get("select", {}) or {}
-              ).get("name")
-
-              status = (
-                  props.get("Hosting Status", {})
-                  .get("select", {}) or {}
-              ).get("name")
-
-              service_id = plain_text(
-                  props.get("Render Service ID", {}).get("rich_text", [])
+          def get_text(items):
+              return "".join(
+                  item.get("plain_text", "")
+                  for item in (items or [])
               ).strip()
 
-              print(f"PROJECT: {name}")
+          def get_project_data(project):
+              properties = project.get("properties", {})
+
+              name = get_text(
+                  properties.get("Project Name", {}).get("title", [])
+              ) or "Unnamed project"
+
+              expiry_data = (
+                  properties.get("Hosting Expiry Date", {}).get("date") or {}
+              )
+
+              expiry = expiry_data.get("start")
+
+              extension_data = (
+                  properties.get("Hosting Extension", {}).get("select") or {}
+              )
+
+              extension = extension_data.get("name")
+
+              status_data = (
+                  properties.get("Hosting Status", {}).get("select") or {}
+              )
+
+              status = status_data.get("name")
+
+              service_id = get_text(
+                  properties.get("Render Service ID", {}).get("rich_text", [])
+              )
+
+              return {
+                  "page_id": project["id"],
+                  "name": name,
+                  "expiry": expiry,
+                  "extension": extension,
+                  "status": status,
+                  "service_id": service_id
+              }
+
+          def evaluate(project, service):
+              status = project["status"]
+              extension = project["extension"]
+              expiry = project["expiry"]
 
               if status == "Not Applicable":
-                  print("DECISION: SKIP — Hosting not applicable")
-                  print("")
-                  continue
-
-              if not service_id or service_id not in services:
-                  print("DECISION: SKIP — Render service not found")
-                  print("")
-                  continue
-
-              service = services[service_id]
-
-              if service.get("type") != "static_site":
-                  print("DECISION: SKIP — Service is not a Static Site")
-                  print("")
-                  continue
-
-              suspended = service.get("suspended")
+                  return "IGNORE"
 
               if extension == "Lifetime":
-                  print("DECISION: KEEP RUNNING — Lifetime hosting")
-                  print("")
+                  if service["suspended"] == "suspended":
+                      return "MANUAL REVIEW - LIFETIME SITE SUSPENDED"
+                  return "KEEP RUNNING - LIFETIME"
 
-              elif not expiry:
-                  print("DECISION: SKIP — Expiry date missing")
-                  print("")
+              if not project["service_id"]:
+                  return "SKIP - MISSING SERVICE ID"
 
-              elif status not in ("Active", "Expired"):
-                  print("DECISION: SKIP — Unrecognised hosting status")
-                  print("")
+              if not expiry:
+                  return "SKIP - MISSING EXPIRY DATE"
 
-              else:
-                  expiry_date = date.fromisoformat(expiry)
+              if status not in ("Active", "Expired"):
+                  return "SKIP - UNKNOWN HOSTING STATUS"
 
-                  if status == "Active" and expiry_date < TODAY:
+              expiry_date = date.fromisoformat(expiry)
+              suspended = service["suspended"]
+
+              if service["type"] != "static_site":
+                  return "SKIP - NOT A STATIC SITE"
+
+              if status == "Active" and expiry_date < TODAY:
+                  if suspended == "suspended":
+                      return "ALREADY SUSPENDED - MARK EXPIRED"
+                  return "WOULD SUSPEND AND MARK EXPIRED"
+
+              if expiry_date >= TODAY:
+                  if status == "Expired":
+                      if extension not in (
+                          "7 Days", "15 Days", "30 Days",
+                          "60 Days", "90 Days"
+                      ):
+                          return "SKIP - VERIFY EXTENSION VALUE"
+
                       if suspended == "suspended":
-                          print("DECISION: ALREADY SUSPENDED")
-                      else:
-                          print("DECISION: WOULD SUSPEND")
-                      print(f"REASON: Expired on {expiry_date}")
+                          return "WOULD RESUME AND MARK ACTIVE"
 
-                  elif status == "Active" and expiry_date >= TODAY:
-                      if suspended == "suspended":
-                          print("DECISION: WOULD RESUME")
-                      else:
-                          print("DECISION: KEEP RUNNING")
-                      print(f"EXPIRY: {expiry_date}")
+                      return "WOULD MARK ACTIVE - ALREADY RUNNING"
 
-                  elif status == "Expired" and expiry_date > TODAY:
-                      print("DECISION: SKIP — Set Hosting Status to Active")
-                      print("REASON: Extension requires manual status update")
+                  return "KEEP RUNNING"
 
-                  else:
-                      print("DECISION: KEEP EXPIRED")
-                      print(f"EXPIRY: {expiry_date}")
+              if status == "Expired":
+                  return "KEEP SUSPENDED"
 
-                  print(f"EXTENSION: {extension or 'Not set'}")
+              return "SKIP - UNHANDLED CONDITION"
 
-              print(f"RENDER STATE: {suspended}")
-              print(f"SERVICE ID: {service_id}")
-              print("")
+          print("=" * 65)
+          print("LOVE IN PIXELS 4U - HOSTING LIFECYCLE MANAGER")
+          print("=" * 65)
 
-          print("Dry-run evaluation completed.")
-          print("No live actions were performed.")
+          print(f"Evaluation date (IST): {TODAY}")
+          print(f"Dry-run mode: {DRY_RUN}")
+          print("No live actions are permitted in this version.")
+          print("")
+
+          projects = get_notion_projects()
+
+          print(f"Notion projects retrieved: {len(projects)}")
+          print("")
+
+          service_cache = {}
+
+          for record in projects:
+              project = get_project_data(record)
+
+              print("-" * 65)
+              print(f"PROJECT: {project['name']}")
+              print(f"EXPIRY: {project['expiry'] or 'Not set'}")
+              print(f"EXTENSION: {project['extension'] or 'Not set'}")
+              print(f"STATUS: {project['status'] or 'Not set'}")
+
+              if project["status"] == "Not Applicable":
+                  print("DECISION: IGNORE")
+                  continue
+
+              service_id = project["service_id"]
+
+              if not service_id:
+                  print("DECISION: SKIP - MISSING SERVICE ID")
+                  continue
+
+              try:
+                  if service_id not in service_cache:
+                      service_cache[service_id] = get_render_service(
+                          service_id
+                      )
+
+                  service = service_cache[service_id]
+
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      print("DECISION: SKIP - SERVICE NOT FOUND")
+                      continue
+                  raise
+
+              decision = evaluate(project, service)
+
+              print(f"RENDER SERVICE: {service.get('name', 'Unknown')}")
+              print(f"SERVICE TYPE: {service.get('type', 'Unknown')}")
+              print(f"RENDER STATE: {service.get('suspended', 'Unknown')}")
+              print(f"DECISION: {decision}")
+
+          print("")
+          print("=" * 65)
+          print("HOSTING EVALUATION COMPLETED")
+          print("No Render or Notion records were modified.")
+          print("=" * 65)
+
           PY
