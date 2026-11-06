@@ -1,0 +1,215 @@
+
+name: Hosting Lifecycle Manager
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 12:15 AM India Standard Time (18:45 UTC previous day)
+    - cron: "45 18 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  hosting-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Evaluate hosting lifecycle
+        env:
+          NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
+          TZ: Asia/Kolkata
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+          from datetime import date
+          from zoneinfo import ZoneInfo
+
+          NOTION_KEY = os.environ["NOTION_API_KEY"]
+          RENDER_KEY = os.environ["RENDER_API_KEY"]
+          DATA_SOURCE_ID = os.environ["DATA_SOURCE_ID"]
+
+          NOTION_VERSION = "2025-09-03"
+          TODAY = date.today()
+          IST = ZoneInfo("Asia/Kolkata")
+
+          def request(url, token, version=None, method="GET", body=None):
+              headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/json"
+              }
+
+              if version:
+                  headers["Notion-Version"] = version
+
+              if body is not None:
+                  headers["Content-Type"] = "application/json"
+
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(
+                  url, data=data, headers=headers, method=method
+              )
+
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      return json.loads(response.read())
+              except urllib.error.HTTPError as error:
+                  print(f"API request failed: HTTP {error.code}")
+                  raise
+
+          def plain_text(items):
+              return "".join(item.get("plain_text", "") for item in (items or []))
+
+          def get_projects():
+              results = []
+              cursor = None
+
+              while True:
+                  body = {"page_size": 100}
+                  if cursor:
+                      body["start_cursor"] = cursor
+
+                  response = request(
+                      f"https://api.notion.com/v1/data_sources/{DATA_SOURCE_ID}/query",
+                      NOTION_KEY,
+                      version=NOTION_VERSION,
+                      method="POST",
+                      body=body
+                  )
+
+                  results.extend(response.get("results", []))
+
+                  if not response.get("has_more"):
+                      break
+
+                  cursor = response.get("next_cursor")
+                  if not cursor:
+                      raise RuntimeError("Notion pagination cursor missing.")
+
+              return results
+
+          def get_render_services():
+              response = request(
+                  "https://api.render.com/v1/services?limit=100",
+                  RENDER_KEY
+              )
+
+              return {
+                  item["service"]["id"]: item["service"]
+                  for item in response
+                  if item.get("service", {}).get("id")
+              }
+
+          projects = get_projects()
+          services = get_render_services()
+
+          print(f"Today's date (IST): {TODAY}")
+          print(f"Projects retrieved: {len(projects)}")
+          print(f"Render services retrieved: {len(services)}")
+          print("")
+          print("DRY-RUN MODE: No services or Notion records will be modified.")
+          print("")
+
+          for project in projects:
+              props = project.get("properties", {})
+
+              name = plain_text(
+                  props.get("Project Name", {}).get("title", [])
+              ) or "Unnamed project"
+
+              expiry = (
+                  props.get("Hosting Expiry Date", {})
+                  .get("date", {}) or {}
+              ).get("start")
+
+              extension = (
+                  props.get("Hosting Extension", {})
+                  .get("select", {}) or {}
+              ).get("name")
+
+              status = (
+                  props.get("Hosting Status", {})
+                  .get("select", {}) or {}
+              ).get("name")
+
+              service_id = plain_text(
+                  props.get("Render Service ID", {}).get("rich_text", [])
+              ).strip()
+
+              print(f"PROJECT: {name}")
+
+              if status == "Not Applicable":
+                  print("DECISION: SKIP — Hosting not applicable")
+                  print("")
+                  continue
+
+              if not service_id or service_id not in services:
+                  print("DECISION: SKIP — Render service not found")
+                  print("")
+                  continue
+
+              service = services[service_id]
+
+              if service.get("type") != "static_site":
+                  print("DECISION: SKIP — Service is not a Static Site")
+                  print("")
+                  continue
+
+              suspended = service.get("suspended")
+
+              if extension == "Lifetime":
+                  print("DECISION: KEEP RUNNING — Lifetime hosting")
+                  print("")
+
+              elif not expiry:
+                  print("DECISION: SKIP — Expiry date missing")
+                  print("")
+
+              elif status not in ("Active", "Expired"):
+                  print("DECISION: SKIP — Unrecognised hosting status")
+                  print("")
+
+              else:
+                  expiry_date = date.fromisoformat(expiry)
+
+                  if status == "Active" and expiry_date < TODAY:
+                      if suspended == "suspended":
+                          print("DECISION: ALREADY SUSPENDED")
+                      else:
+                          print("DECISION: WOULD SUSPEND")
+                      print(f"REASON: Expired on {expiry_date}")
+
+                  elif status == "Active" and expiry_date >= TODAY:
+                      if suspended == "suspended":
+                          print("DECISION: WOULD RESUME")
+                      else:
+                          print("DECISION: KEEP RUNNING")
+                      print(f"EXPIRY: {expiry_date}")
+
+                  elif status == "Expired" and expiry_date > TODAY:
+                      print("DECISION: SKIP — Set Hosting Status to Active")
+                      print("REASON: Extension requires manual status update")
+
+                  else:
+                      print("DECISION: KEEP EXPIRED")
+                      print(f"EXPIRY: {expiry_date}")
+
+                  print(f"EXTENSION: {extension or 'Not set'}")
+
+              print(f"RENDER STATE: {suspended}")
+              print(f"SERVICE ID: {service_id}")
+              print("")
+
+          print("Dry-run evaluation completed.")
+          print("No live actions were performed.")
+          PY
