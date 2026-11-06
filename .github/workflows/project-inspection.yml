@@ -12,19 +12,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Retrieve and inspect project hosting data
+      - name: Retrieve and diagnose project properties
         env:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           DATA_SOURCE_ID: ${{ vars.NOTION_PROJECTS_DATA_SOURCE_ID }}
         run: |
           set -euo pipefail
-
-          if [ -z "$NOTION_API_KEY" ] || [ -z "$DATA_SOURCE_ID" ]; then
-            echo "Missing Notion credentials or data source ID."
-            exit 1
-          fi
-
-          echo "Retrieving Projects records..."
 
           curl --silent --show-error --fail-with-body \
             -X POST \
@@ -32,47 +25,40 @@ jobs:
             -H "Authorization: Bearer ${NOTION_API_KEY}" \
             -H "Notion-Version: 2025-09-03" \
             -H "Content-Type: application/json" \
-            -d '{"page_size": 100}' \
+            -d '{"page_size": 5}' \
             -o projects.json
 
           echo "Projects retrieved successfully."
 
-          jq -r '
-            def prop($name): .properties[$name];
+          echo "Response structure:"
+          jq '{
+            results_type: (.results | type),
+            record_count: (.results | length),
+            properties_type: (.results[0].properties | type),
+            property_names: (
+              if (.results[0].properties | type) == "object"
+              then (.results[0].properties | keys)
+              else []
+              end
+            )
+          }' projects.json
 
-            def title_value:
-              map(.plain_text) | join("");
+          echo ""
+          echo "Hosting property structures:"
 
-            def select_value:
-              if . == null then "Not set"
-              else .name // "Not set"
-              end;
-
-            def date_value:
-              if . == null then "Not set"
-              else .start // "Not set"
-              end;
-
-            def text_value:
-              if . == null then "Not set"
-              else .rich_text | title_value
-              end;
-
-            (
-              ["PROJECT", "EXPIRY DATE", "EXTENSION", "STATUS", "RENDER SERVICE ID"],
-              (
-                .results[] |
-                [
-                  (prop("Project Name").title | title_value),
-                  (prop("Hosting Expiry Date").date | date_value),
-                  (prop("Hosting Extension").select | select_value),
-                  (prop("Hosting Status").select | select_value),
-                  (prop("Render Service ID").rich_text | text_value)
-                ]
-              )
-            ) | @tsv
+          jq '
+            .results[] |
+            {
+              hosting_expiry_type:
+                (.properties["Hosting Expiry Date"] | type),
+              hosting_extension_type:
+                (.properties["Hosting Extension"] | type),
+              hosting_status_type:
+                (.properties["Hosting Status"] | type),
+              render_service_id_type:
+                (.properties["Render Service ID"] | type)
+            }
           ' projects.json
 
           echo ""
-          echo "Has more pages: $(jq -r '.has_more' projects.json)"
-          echo "Records retrieved: $(jq '.results | length' projects.json)"
+          echo "Diagnostic completed."
